@@ -340,6 +340,7 @@ struct PutObjectArgs : public PutObjectBaseArgs {
   std::istream* stream = nullptr;
   char* buf = nullptr;
   std::optional<size_t> size;
+  unsigned int max_inflight_parts = 1;
   http::ProgressFunction progressfunc = nullptr;
   void* progress_userdata = nullptr;
 #ifdef MINIO_CPP_RDMA

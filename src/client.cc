@@ -24,14 +24,17 @@
 #endif
 
 #include <curlpp/cURLpp.hpp>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <list>
 #include <memory>
 #include <string>
 #include <system_error>
 #include <type_traits>
+#include <vector>
 
 #include "miniocpp/args.h"
 #include "miniocpp/baseclient.h"
@@ -74,6 +77,17 @@ struct AlignedBuffer {
   explicit AlignedBuffer(void* p) : ptr(p) {}
   AlignedBuffer(const AlignedBuffer&) = delete;
   AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+  AlignedBuffer(AlignedBuffer&& other) noexcept : ptr(other.ptr) {
+    other.ptr = nullptr;
+  }
+  AlignedBuffer& operator=(AlignedBuffer&& other) noexcept {
+    if (this != &other) {
+      if (ptr) AlignedFree(ptr);
+      ptr = other.ptr;
+      other.ptr = nullptr;
+    }
+    return *this;
+  }
   ~AlignedBuffer() {
     if (ptr) AlignedFree(ptr);
   }
@@ -547,160 +561,225 @@ PutObjectResponse Client::PutObject(PutObjectArgs args, std::string& upload_id,
   size_t uploaded_size = 0;
   unsigned int part_number = 0;
   std::string one_byte;
-  bool stop = false;
   std::list<Part> parts;
   long part_count = args.part_count;
   double uploaded_bytes = 0;  // for progress
   double upload_speed = -1;   // for progress
+  size_t max_inflight_parts = static_cast<size_t>(args.max_inflight_parts);
 
-  while (!stop) {
-    part_number++;
+  if (max_inflight_parts <= 1) {
+    bool stop = false;
+    while (!stop) {
+      part_number++;
 
-    size_t bytes_read = 0;
-    if (part_count > 0) {
-      if (part_number == part_count) {
-        part_size = object_size - uploaded_size;
-        stop = true;
-      }
-
-      if (error::Error err =
-              utils::ReadPart(*args.stream, buf, part_size, bytes_read)) {
-        return PutObjectResponse(err);
-      }
-
-      if (bytes_read != part_size) {
-        return error::make<PutObjectResponse>(
-            "not enough data in the stream; expected: " +
-            std::to_string(part_size) + ", got: " + std::to_string(bytes_read) +
-            " bytes");
-      }
-    } else {
-      char* b = buf;
-      size_t size = part_size + 1;
-
-      if (!one_byte.empty()) {
-        buf[0] = one_byte.front();
-        b = buf + 1;
-        size--;
-        bytes_read = 1;
-        one_byte = "";
-      }
-
-      size_t n = 0;
-      if (error::Error err = utils::ReadPart(*args.stream, b, size, n)) {
-        return PutObjectResponse(err);
-      }
-
-      bytes_read += n;
-
-      // If bytes read is less than or equals to part size, then we have reached
-      // last part.
-      if (bytes_read <= part_size) {
-        part_count = part_number;
-        part_size = bytes_read;
-        stop = true;
-      } else {
-        one_byte = buf[part_size + 1];
-      }
-    }
-
-    std::string_view data(buf, part_size);
-
-    uploaded_size += part_size;
-
-    if (part_count == 1) {
-      PutObjectApiArgs api_args;
-      api_args.extra_query_params = args.extra_query_params;
-      api_args.bucket = args.bucket;
-      api_args.region = args.region;
-      api_args.object = args.object;
-      api_args.data = data;
-      api_args.buf = buf;
-      api_args.size = part_size;
-      api_args.progressfunc = args.progressfunc;
-      api_args.progress_userdata = args.progress_userdata;
-      api_args.headers = headers;
-
-      return BaseClient::PutObject(api_args);
-    }
-
-    if (upload_id.empty()) {
-      CreateMultipartUploadArgs cmu_args;
-      cmu_args.extra_query_params = args.extra_query_params;
-      cmu_args.bucket = args.bucket;
-      cmu_args.region = args.region;
-      cmu_args.object = args.object;
-      cmu_args.headers = headers;
-#ifdef MINIO_CPP_RDMA
-      // Declare CRC64NVME so the server enforces per-part integrity on the
-      // RDMA UploadPart path (server returns 501 if checksum is missing when
-      // an algorithm was declared on Create).
-      cmu_args.headers.Add("x-amz-checksum-algorithm", "CRC64NVME");
-#endif
-      if (CreateMultipartUploadResponse resp =
-              CreateMultipartUpload(cmu_args)) {
-        upload_id = resp.upload_id;
-      } else {
-        return PutObjectResponse(resp);
-      }
-    }
-
-    UploadPartArgs up_args;
-    up_args.bucket = args.bucket;
-    up_args.region = args.region;
-    up_args.object = args.object;
-    up_args.upload_id = upload_id;
-    up_args.part_number = part_number;
-    up_args.data = data;
-    up_args.buf = buf;
-    up_args.part_size = part_size;
-#ifdef MINIO_CPP_RDMA
-    up_args.rdmaclient = args.rdmaclient;
-    if (buf != nullptr &&
-        cuObjClient::getMemoryType(buf) == CUOBJ_MEMORY_SYSTEM) {
-      const std::string crc = utils::Crc64NvmeBase64(buf, part_size);
-      up_args.checksum_crc64nvme = crc;
-      up_args.headers.Add("x-amz-checksum-crc64nvme", crc);
-    }
-#endif
-    if (args.progressfunc != nullptr) {
-      up_args.progressfunc =
-          [&object_size = object_size, &uploaded_bytes = uploaded_bytes,
-           &upload_speed = upload_speed, &progressfunc = args.progressfunc,
-           &progress_userdata = args.progress_userdata](
-              http::ProgressFunctionArgs args) -> bool {
-        if (args.upload_speed > 0) {
-          if (upload_speed == -1) {
-            upload_speed = args.upload_speed;
-          } else {
-            upload_speed = (upload_speed + args.upload_speed) / 2;
-          }
-          return true;
+      size_t bytes_read = 0;
+      if (part_count > 0) {
+        if (part_number == part_count) {
+          part_size = object_size - uploaded_size;
+          stop = true;
         }
 
-        http::ProgressFunctionArgs actual_args;
-        actual_args.upload_total_bytes = static_cast<double>(object_size);
-        actual_args.uploaded_bytes = uploaded_bytes + args.uploaded_bytes;
-        actual_args.userdata = progress_userdata;
-        return progressfunc(actual_args);
-      };
-    }
-    // Propagate caller-supplied x-amz-content-sha256 (e.g. UNSIGNED-PAYLOAD
-    // for GPU-resident buffers) into each UploadPart so the per-part signing
-    // path also skips hashing the body.
-    if (headers.Contains("x-amz-content-sha256")) {
-      up_args.headers.Add("x-amz-content-sha256",
-                          headers.GetFront("x-amz-content-sha256"));
-    }
-    if (args.sse != nullptr) {
-      if (SseCustomerKey* ssec = dynamic_cast<SseCustomerKey*>(args.sse)) {
-        up_args.headers.AddAll(ssec->Headers());
+        if (error::Error err =
+                utils::ReadPart(*args.stream, buf, part_size, bytes_read)) {
+          return PutObjectResponse(err);
+        }
+
+        if (bytes_read != part_size) {
+          return error::make<PutObjectResponse>(
+              "not enough data in the stream; expected: " +
+              std::to_string(part_size) +
+              ", got: " + std::to_string(bytes_read) + " bytes");
+        }
+      } else {
+        char* b = buf;
+        size_t size = part_size + 1;
+
+        if (!one_byte.empty()) {
+          buf[0] = one_byte.front();
+          b = buf + 1;
+          size--;
+          bytes_read = 1;
+          one_byte = "";
+        }
+
+        size_t n = 0;
+        if (error::Error err = utils::ReadPart(*args.stream, b, size, n)) {
+          return PutObjectResponse(err);
+        }
+
+        bytes_read += n;
+
+        // If bytes read is less than or equals to part size, then we have
+        // reached last part.
+        if (bytes_read <= part_size) {
+          part_count = part_number;
+          part_size = bytes_read;
+          stop = true;
+        } else {
+          one_byte = buf[part_size];
+        }
+      }
+
+      std::string_view data(buf, part_size);
+
+      uploaded_size += part_size;
+
+      if (part_count == 1) {
+        PutObjectApiArgs api_args;
+        api_args.extra_query_params = args.extra_query_params;
+        api_args.bucket = args.bucket;
+        api_args.region = args.region;
+        api_args.object = args.object;
+        api_args.data = data;
+        api_args.buf = buf;
+        api_args.size = part_size;
+        api_args.progressfunc = args.progressfunc;
+        api_args.progress_userdata = args.progress_userdata;
+        api_args.headers = headers;
+
+        return BaseClient::PutObject(api_args);
+      }
+
+      if (upload_id.empty()) {
+        CreateMultipartUploadArgs cmu_args;
+        cmu_args.extra_query_params = args.extra_query_params;
+        cmu_args.bucket = args.bucket;
+        cmu_args.region = args.region;
+        cmu_args.object = args.object;
+        cmu_args.headers = headers;
+#ifdef MINIO_CPP_RDMA
+        cmu_args.headers.Add("x-amz-checksum-algorithm", "CRC64NVME");
+#endif
+        if (CreateMultipartUploadResponse resp =
+                CreateMultipartUpload(cmu_args)) {
+          upload_id = resp.upload_id;
+        } else {
+          return PutObjectResponse(resp);
+        }
+      }
+
+      UploadPartArgs up_args;
+      up_args.bucket = args.bucket;
+      up_args.region = args.region;
+      up_args.object = args.object;
+      up_args.upload_id = upload_id;
+      up_args.part_number = part_number;
+      up_args.data = data;
+      up_args.buf = buf;
+      up_args.part_size = part_size;
+#ifdef MINIO_CPP_RDMA
+      up_args.rdmaclient = args.rdmaclient;
+      if (buf != nullptr &&
+          cuObjClient::getMemoryType(buf) == CUOBJ_MEMORY_SYSTEM) {
+        const std::string crc = utils::Crc64NvmeBase64(buf, part_size);
+        up_args.checksum_crc64nvme = crc;
+        up_args.headers.Add("x-amz-checksum-crc64nvme", crc);
+      }
+#endif
+      if (args.progressfunc != nullptr) {
+        up_args.progressfunc =
+            [&object_size = object_size, &uploaded_bytes = uploaded_bytes,
+             &upload_speed = upload_speed, &progressfunc = args.progressfunc,
+             &progress_userdata = args.progress_userdata](
+                http::ProgressFunctionArgs args) -> bool {
+          if (args.upload_speed > 0) {
+            if (upload_speed == -1) {
+              upload_speed = args.upload_speed;
+            } else {
+              upload_speed = (upload_speed + args.upload_speed) / 2;
+            }
+            return true;
+          }
+
+          http::ProgressFunctionArgs actual_args;
+          actual_args.upload_total_bytes = static_cast<double>(object_size);
+          actual_args.uploaded_bytes = uploaded_bytes + args.uploaded_bytes;
+          actual_args.userdata = progress_userdata;
+          return progressfunc(actual_args);
+        };
+      }
+      if (headers.Contains("x-amz-content-sha256")) {
+        up_args.headers.Add("x-amz-content-sha256",
+                            headers.GetFront("x-amz-content-sha256"));
+      }
+      if (args.sse != nullptr) {
+        if (SseCustomerKey* ssec = dynamic_cast<SseCustomerKey*>(args.sse)) {
+          up_args.headers.AddAll(ssec->Headers());
+        }
+      }
+
+      if (UploadPartResponse resp = UploadPart(up_args)) {
+        if (args.progressfunc != nullptr) {
+          uploaded_bytes += static_cast<double>(data.length());
+          http::ProgressFunctionArgs actual_args;
+          actual_args.upload_total_bytes = static_cast<double>(object_size);
+          actual_args.uploaded_bytes = uploaded_bytes;
+          actual_args.userdata = args.progress_userdata;
+          if (!args.progressfunc(actual_args)) {
+            return UploadPartResponse(
+                error::Error("aborted by progress function"));
+          }
+        }
+        parts.push_back(Part(part_number, std::move(resp.etag),
+                             std::move(up_args.checksum_crc64nvme)));
+      } else {
+        return resp;
       }
     }
+  } else {
+    std::vector<AlignedBuffer> extra_buffers;
+    std::vector<char*> buffers;
+    buffers.reserve(max_inflight_parts);
+    buffers.push_back(buf);
+    for (size_t i = 1; i < max_inflight_parts; ++i) {
+      void* raw = nullptr;
+      if (AlignedAlloc(
+              &raw, GetPageSize(),
+              (args.part_count > 0) ? args.part_size : args.part_size + 1)) {
+        return error::make<PutObjectResponse>(
+            "unable to allocate system memory with alignment");
+      }
+      extra_buffers.emplace_back(raw);
+      buffers.push_back(static_cast<char*>(raw));
+    }
 
-    if (UploadPartResponse resp = UploadPart(up_args)) {
+#ifdef MINIO_CPP_RDMA
+    std::vector<ScopedRDMARegistration> rdma_regs;
+    if (args.rdmaclient != nullptr) {
+      for (size_t i = 1; i < max_inflight_parts; ++i) {
+        char* extra_buf = buffers[i];
+        if (args.rdmaclient->cuMemObjGetDescriptor(extra_buf,
+                                                   args.part_size) == 0) {
+          rdma_regs.emplace_back(args.rdmaclient, extra_buf);
+        }
+      }
+    }
+#endif
+
+    struct InflightUpload {
+      unsigned int part_number = 0;
+      size_t bytes = 0;
+      std::string checksum_crc64nvme;
+      std::future<UploadPartResponse> future;
+    };
+
+    std::deque<InflightUpload> inflight;
+    bool stop = false;
+    size_t produced_parts = 0;
+
+    auto drain_one = [&]() -> PutObjectResponse {
+      InflightUpload inflight_upload = std::move(inflight.front());
+      inflight.pop_front();
+
+      UploadPartResponse resp = inflight_upload.future.get();
+      if (!resp) {
+        return resp;
+      }
+
+      parts.push_back(Part(inflight_upload.part_number, std::move(resp.etag),
+                           std::move(inflight_upload.checksum_crc64nvme)));
       if (args.progressfunc != nullptr) {
-        uploaded_bytes += static_cast<double>(data.length());
+        uploaded_bytes += static_cast<double>(inflight_upload.bytes);
         http::ProgressFunctionArgs actual_args;
         actual_args.upload_total_bytes = static_cast<double>(object_size);
         actual_args.uploaded_bytes = uploaded_bytes;
@@ -710,11 +789,152 @@ PutObjectResponse Client::PutObject(PutObjectArgs args, std::string& upload_id,
               error::Error("aborted by progress function"));
         }
       }
-      // HTTP fallback leaves resp.checksum_crc64nvme empty; use the local CRC.
-      parts.push_back(Part(part_number, std::move(resp.etag),
-                           std::move(up_args.checksum_crc64nvme)));
-    } else {
-      return resp;
+
+      return PutObjectResponse();
+    };
+
+    while (!stop) {
+      if (inflight.size() == max_inflight_parts) {
+        PutObjectResponse drain_resp = drain_one();
+        if (!drain_resp) {
+          return drain_resp;
+        }
+      }
+
+      char* part_buf = buffers[produced_parts % max_inflight_parts];
+      part_number++;
+      produced_parts++;
+
+      size_t current_part_size = part_size;
+      size_t bytes_read = 0;
+      if (part_count > 0) {
+        if (part_number == part_count) {
+          current_part_size = object_size - uploaded_size;
+          stop = true;
+        }
+
+        if (error::Error err = utils::ReadPart(*args.stream, part_buf,
+                                               current_part_size, bytes_read)) {
+          return PutObjectResponse(err);
+        }
+
+        if (bytes_read != current_part_size) {
+          return error::make<PutObjectResponse>(
+              "not enough data in the stream; expected: " +
+              std::to_string(current_part_size) +
+              ", got: " + std::to_string(bytes_read) + " bytes");
+        }
+      } else {
+        char* b = part_buf;
+        size_t size = part_size + 1;
+
+        if (!one_byte.empty()) {
+          part_buf[0] = one_byte.front();
+          b = part_buf + 1;
+          size--;
+          bytes_read = 1;
+          one_byte = "";
+        }
+
+        size_t n = 0;
+        if (error::Error err = utils::ReadPart(*args.stream, b, size, n)) {
+          return PutObjectResponse(err);
+        }
+
+        bytes_read += n;
+
+        if (bytes_read <= part_size) {
+          part_count = part_number;
+          current_part_size = bytes_read;
+          stop = true;
+        } else {
+          one_byte = part_buf[part_size];
+        }
+      }
+
+      uploaded_size += current_part_size;
+
+      std::string_view data(part_buf, current_part_size);
+      if (part_count == 1) {
+        PutObjectApiArgs api_args;
+        api_args.extra_query_params = args.extra_query_params;
+        api_args.bucket = args.bucket;
+        api_args.region = args.region;
+        api_args.object = args.object;
+        api_args.data = data;
+        api_args.buf = part_buf;
+        api_args.size = current_part_size;
+        api_args.progressfunc = args.progressfunc;
+        api_args.progress_userdata = args.progress_userdata;
+        api_args.headers = headers;
+
+        return BaseClient::PutObject(api_args);
+      }
+
+      if (upload_id.empty()) {
+        CreateMultipartUploadArgs cmu_args;
+        cmu_args.extra_query_params = args.extra_query_params;
+        cmu_args.bucket = args.bucket;
+        cmu_args.region = args.region;
+        cmu_args.object = args.object;
+        cmu_args.headers = headers;
+#ifdef MINIO_CPP_RDMA
+        cmu_args.headers.Add("x-amz-checksum-algorithm", "CRC64NVME");
+#endif
+        if (CreateMultipartUploadResponse resp =
+                CreateMultipartUpload(cmu_args)) {
+          upload_id = resp.upload_id;
+        } else {
+          return PutObjectResponse(resp);
+        }
+      }
+
+      UploadPartArgs up_args;
+      up_args.bucket = args.bucket;
+      up_args.region = args.region;
+      up_args.object = args.object;
+      up_args.upload_id = upload_id;
+      up_args.part_number = part_number;
+      up_args.data = data;
+      up_args.buf = part_buf;
+      up_args.part_size = current_part_size;
+      if (headers.Contains("x-amz-content-sha256")) {
+        up_args.headers.Add("x-amz-content-sha256",
+                            headers.GetFront("x-amz-content-sha256"));
+      }
+      if (args.sse != nullptr) {
+        if (SseCustomerKey* ssec = dynamic_cast<SseCustomerKey*>(args.sse)) {
+          up_args.headers.AddAll(ssec->Headers());
+        }
+      }
+#ifdef MINIO_CPP_RDMA
+      up_args.rdmaclient = args.rdmaclient;
+      if (part_buf != nullptr &&
+          cuObjClient::getMemoryType(part_buf) == CUOBJ_MEMORY_SYSTEM) {
+        const std::string crc =
+            utils::Crc64NvmeBase64(part_buf, current_part_size);
+        up_args.checksum_crc64nvme = crc;
+        up_args.headers.Add("x-amz-checksum-crc64nvme", crc);
+      }
+#endif
+
+      InflightUpload inflight_upload;
+      inflight_upload.part_number = part_number;
+      inflight_upload.bytes = current_part_size;
+      inflight_upload.checksum_crc64nvme = up_args.checksum_crc64nvme;
+      inflight_upload.future = std::async(
+          std::launch::async,
+          [this, up_args = std::move(up_args)]() mutable -> UploadPartResponse {
+            return UploadPart(up_args);
+          });
+      inflight.push_back(std::move(inflight_upload));
+    }
+
+    while (!inflight.empty()) {
+      PutObjectResponse drain_resp = drain_one();
+      if (!drain_resp) {
+        return drain_resp;
+      }
     }
   }
 

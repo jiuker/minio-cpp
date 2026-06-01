@@ -705,6 +705,69 @@ class Tests {
       throw;
     }
   }
+  void PutObjectWithInflight() {
+    std::cout << "PutObjectWithInflight()" << std::endl;
+
+    // 10MB data -> auto-calc ~5MiB parts = 2 parts, exercising multipart path
+    const size_t data_size = 10 * 1024 * 1024;
+    std::string object_name = RandObjectName();
+    std::string original_data = RandomString(charset, data_size);
+    std::string original_md5 = minio::utils::Md5sumHash(original_data);
+
+    const unsigned int inflight_values[] = {1, 2, 4};
+    for (auto inflight : inflight_values) {
+      std::stringstream ss(original_data);
+      minio::s3::PutObjectArgs args(ss,
+                                    static_cast<long>(data_size), 0);
+      args.bucket = bucket_name_;
+      args.object = object_name;
+      args.max_inflight_parts = inflight;
+
+      minio::s3::PutObjectResponse resp = client_.PutObject(args);
+      if (!resp) {
+        throw std::runtime_error(
+            "PutObjectWithInflight(max_inflight_parts=" +
+            std::to_string(inflight) + "): " + resp.Error().String());
+      }
+
+      try {
+        std::string downloaded_data;
+        minio::s3::GetObjectArgs get_args;
+        get_args.bucket = bucket_name_;
+        get_args.object = object_name;
+        get_args.datafunc =
+            [&downloaded_data](
+                minio::http::DataFunctionArgs args) -> bool {
+          downloaded_data += args.datachunk;
+          return true;
+        };
+
+        minio::s3::GetObjectResponse get_resp =
+            client_.GetObject(get_args);
+        if (!get_resp) {
+          throw std::runtime_error(
+              "PutObjectWithInflight(max_inflight_parts=" +
+              std::to_string(inflight) +
+              "): GetObject failed: " + get_resp.Error().String());
+        }
+
+        std::string downloaded_md5 =
+            minio::utils::Md5sumHash(downloaded_data);
+        if (original_md5 != downloaded_md5) {
+          throw std::runtime_error(
+              "PutObjectWithInflight(max_inflight_parts=" +
+              std::to_string(inflight) + "): MD5 mismatch; " +
+              "original: " + original_md5 +
+              ", downloaded: " + downloaded_md5);
+        }
+
+        RemoveObject(bucket_name_, object_name);
+      } catch (const std::runtime_error&) {
+        RemoveObject(bucket_name_, object_name);
+        throw;
+      }
+    }
+  }
 };  // class Tests
 
 int main(int /*argc*/, char* /*argv*/[]) {
@@ -762,6 +825,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
   tests.RemoveObjects();
   tests.SelectObjectContent();
   tests.ListenBucketNotification();
+  tests.PutObjectWithInflight();
 
   return EXIT_SUCCESS;
 }

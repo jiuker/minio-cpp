@@ -308,6 +308,9 @@ PutObjectArgs::PutObjectArgs(std::istream& istream, long object_size,
 
 error::Error PutObjectArgs::Validate() {
   if (error::Error err = ObjectArgs::Validate()) return err;
+  if (max_inflight_parts == 0) {
+    return error::Error("max_inflight_parts must be greater than 0");
+  }
   const bool has_stream = (stream != nullptr);
   const bool has_buf = (buf != nullptr);
   if (has_stream == has_buf) {
